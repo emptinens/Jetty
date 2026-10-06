@@ -19,6 +19,7 @@ Minimal, fast GUI AI agent orchestrator with a CLI: terminal sessions that run a
 ## Workflow
 
 - Small increments: build after each change, run the app when behavior changed, verify before push.
+- Swarm workers never run state-changing git commands (commit, stash, reset, checkout). The coordinator owns git and commits before handing work to workers.
 - New dependency needs an explicit yes.
 - Checkpoint with the user before the next big piece. Do not one-shot a plan.
 

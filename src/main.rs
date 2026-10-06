@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window, WindowOptions, div, px, rgb, size,
+    Render, StatefulInteractiveElement, Styled, Window, WindowOptions, div, px, rgb, rgba, size,
 };
 use gpui_platform::application;
 
@@ -14,6 +14,7 @@ struct Root {
     sessions: Vec<session::Session>,
     selected: Option<usize>,
     engine: engine::EngineHandle,
+    quit_dialog: bool,
 }
 
 impl Root {
@@ -22,6 +23,7 @@ impl Root {
             sessions: Vec::new(),
             selected: None,
             engine,
+            quit_dialog: false,
         };
         this.engine.send(Request::Snapshot);
         this
@@ -43,6 +45,8 @@ impl Root {
             Event::Error(msg) => {
                 eprintln!("jetty: engine error: {msg}");
             }
+            Event::Output(_, _) => {} // stub: terminal output in next node
+            Event::Exited(_) => {} // stub: terminal exit in next node
         }
     }
 
@@ -58,7 +62,9 @@ impl Root {
     }
 
     fn remove(&mut self, i: usize) {
-        self.engine.send(Request::Remove(i));
+        if let Some(session) = self.sessions.get(i) {
+            self.engine.send(Request::Remove(session.id));
+        }
     }
 }
 
@@ -114,8 +120,73 @@ impl Render for Root {
             None => vec![div().child("no session selected").into_any_element()],
         };
 
+        let dialog: Vec<AnyElement> = if self.quit_dialog {
+            vec![
+                div()
+                    .absolute()
+                    .size_full()
+                    .bg(rgba(0x000000bb))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_4()
+                            .rounded_lg()
+                            .bg(rgb(0x2a2a2a))
+                            .child(div().text_lg().child("Quit Jetty?"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x9a9a9a))
+                                    .child("Sessions will keep running if you choose 'Leave Running'."),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("quit-kill")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(rgb(0x552222))
+                                            .cursor_pointer()
+                                            .child("Kill Sessions")
+                                            .on_click(cx.listener(move |this, _e, window, _cx| {
+                                                this.quit_dialog = false;
+                                                window.remove_window();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("quit-leave-running")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(rgb(0x224422))
+                                            .cursor_pointer()
+                                            .child("Leave Running")
+                                            .on_click(cx.listener(move |this, _e, window, _cx| {
+                                                this.engine.send(Request::SetKillOnDrop(false));
+                                                this.quit_dialog = false;
+                                                window.remove_window();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .into_any_element(),
+            ]
+        } else {
+            vec![]
+        };
+
         div()
-            .flex()
+            .relative()
             .size_full()
             .bg(rgb(0x111111))
             .text_color(rgb(0xe6e6e6))
@@ -153,6 +224,7 @@ impl Render for Root {
                     .p_4()
                     .children(detail),
             )
+            .children(dialog)
     }
 }
 
@@ -172,8 +244,9 @@ fn run_gui() {
         gpui_tokio::init(cx);
         let (engine, mut events) = engine::start_in_process(cx);
         let root = cx.new(|_| Root::new(engine));
+        let root_for_close = root.clone();
         let weak = root.downgrade();
-        cx.open_window(
+        let _window = cx.open_window(
             WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("Jetty".into()),
@@ -186,7 +259,25 @@ fn run_gui() {
                 ))),
                 ..Default::default()
             },
-            move |_window, _cx| root.clone(),
+            move |window, cx| {
+                window.on_window_should_close(cx, {
+                    let root = root_for_close.clone();
+                    move |_window, app| {
+                        root.update(app, |root, cx| {
+                            if root.quit_dialog {
+                                // dialog already resolved, allow close
+                                true
+                            } else {
+                                // first close attempt, show dialog
+                                root.quit_dialog = true;
+                                cx.notify();
+                                false
+                            }
+                        })
+                    }
+                });
+                root
+            },
         )
         .expect("open window");
         cx.spawn(async move |cx| {
