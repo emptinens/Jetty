@@ -907,6 +907,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Returns the /proc state char for a pid, or None if the process is gone.
+    /// The comm field may contain spaces or parens, so parse after the last ')'.
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_paren = stat.rsplit(')').next()?;
+        after_paren.trim().chars().next()
+    }
+
+    /// True while the process is runnable, sleeping, or in uninterruptible sleep.
+    /// Zombies and reaped processes count as dead.
+    fn process_alive(pid: u32) -> bool {
+        matches!(proc_state(pid), Some('R') | Some('S') | Some('D'))
+    }
+
+    /// Attaches session 1 and waits for its child to publish its pid to
+    /// `dir/pid` (script: `echo $$ > pid; sleep 30`).
+    async fn attach_and_read_child_pid(
+        req_tx: &tokio::sync::mpsc::UnboundedSender<Request>,
+        pid_path: &std::path::Path,
+    ) -> u32 {
+        req_tx.send(Request::Attach(1)).unwrap();
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(pid_path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("child never published its pid to {:?}", pid_path);
+    }
+
+    /// Default behavior: when the engine's run loop ends and State drops,
+    /// the attached child is killed (SIGKILL via the Drop impl).
+    #[tokio::test]
+    async fn engine_drop_kills_child_by_default() {
+        let dir = std::env::temp_dir().join(format!("jpt-kod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = dir.join("s");
+        std::fs::write(&s, "#!/bin/sh\necho $$ > pid\nsleep 30").unwrap();
+        std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let session = Session {
+            id: 1,
+            name: "kod".into(),
+            directory: dir.to_string_lossy().into(),
+            command: s.to_string_lossy().into(),
+        };
+        let state = State {
+            path: dir.join("sessions.json"),
+            sessions: vec![session],
+            runtimes: HashMap::default(),
+            kill_on_drop: true,
+            write_tx: None,
+        };
+        let (req_tx, req_rx) = unbounded_channel::<Request>();
+        let (internal_tx, internal_rx) = unbounded_channel::<Event>();
+        let (client_tx, _ev_rx) = unbounded_channel::<Event>();
+        let engine = tokio::spawn(run(req_rx, internal_tx, internal_rx, client_tx, state));
+
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            attach_and_read_child_pid(&req_tx, &dir.join("pid")).await
+        })
+        .await
+        .unwrap();
+        assert!(process_alive(pid), "child must be alive before engine drop");
+
+        drop(req_tx);
+        engine.await.unwrap();
+
+        let mut dead = false;
+        for _ in 0..100 {
+            if !process_alive(pid) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(dead, "child must die when State drops with kill_on_drop=true");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The quit dialog's "Leave Running" path: Request::SetKillOnDrop(false)
+    /// must reach State before the run loop ends, so the attached child is
+    /// spared when State drops. The reader thread keeps a dup of the pty
+    /// master, so no SIGHUP is delivered to the child.
+    #[tokio::test]
+    async fn set_kill_on_drop_false_spares_child_on_engine_drop() {
+        let dir = std::env::temp_dir().join(format!("jpt-lr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = dir.join("s");
+        std::fs::write(&s, "#!/bin/sh\necho $$ > pid\nsleep 30").unwrap();
+        std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let session = Session {
+            id: 1,
+            name: "lr".into(),
+            directory: dir.to_string_lossy().into(),
+            command: s.to_string_lossy().into(),
+        };
+        let state = State {
+            path: dir.join("sessions.json"),
+            sessions: vec![session],
+            runtimes: HashMap::default(),
+            kill_on_drop: true,
+            write_tx: None,
+        };
+        let (req_tx, req_rx) = unbounded_channel::<Request>();
+        let (internal_tx, internal_rx) = unbounded_channel::<Event>();
+        let (client_tx, _ev_rx) = unbounded_channel::<Event>();
+        let engine = tokio::spawn(run(req_rx, internal_tx, internal_rx, client_tx, state));
+
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            attach_and_read_child_pid(&req_tx, &dir.join("pid")).await
+        })
+        .await
+        .unwrap();
+        assert!(process_alive(pid), "child must be alive before engine drop");
+
+        // Same ordering as the dialog's Leave Running click: send the request,
+        // then close the window (which ends the engine loop and drops State).
+        req_tx.send(Request::SetKillOnDrop(false)).unwrap();
+        drop(req_tx);
+        engine.await.unwrap();
+
+        assert!(
+            process_alive(pid),
+            "child must survive State drop after SetKillOnDrop(false)"
+        );
+        // Re-check after a settle window: nothing may kill it asynchronously.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            process_alive(pid),
+            "child must still be alive 200ms after engine drop"
+        );
+
+        // Cleanup: kill the spared child so it does not linger for 30s.
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn remove_session_drops_orphaned_pty_events() {
         // Integration test: attach a PTY, remove the session, verify no
