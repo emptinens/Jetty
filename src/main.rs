@@ -1,43 +1,64 @@
-use std::path::PathBuf;
-
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement,
     Render, StatefulInteractiveElement, Styled, Window, WindowOptions, div, px, rgb, size,
 };
 use gpui_platform::application;
 
+mod engine;
+mod protocol;
 mod session;
+
+use crate::protocol::{Event, Request};
 
 struct Root {
     sessions: Vec<session::Session>,
     selected: Option<usize>,
-    path: PathBuf,
+    engine: engine::EngineHandle,
 }
 
 impl Root {
+    fn new(engine: engine::EngineHandle) -> Self {
+        let this = Self {
+            sessions: Vec::new(),
+            selected: None,
+            engine,
+        };
+        this.engine.send(Request::Snapshot);
+        this
+    }
+
+    fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        match event {
+            Event::Sessions(list) => {
+                self.sessions = list;
+                if self.sessions.is_empty() {
+                    self.selected = None;
+                } else if self.selected.is_none() {
+                    self.selected = Some(0);
+                } else if self.selected.is_some_and(|s| s >= self.sessions.len()) {
+                    self.selected = Some(self.sessions.len() - 1);
+                }
+                cx.notify();
+            }
+            Event::Error(msg) => {
+                eprintln!("jetty: engine error: {msg}");
+            }
+        }
+    }
+
     fn select(&mut self, i: usize, cx: &mut Context<Self>) {
         self.selected = Some(i);
         cx.notify();
     }
 
     fn add(&mut self, cx: &mut Context<Self>) {
-        let mut s = session::default_session();
-        s.name = format!("shell {}", self.sessions.len() + 1);
-        self.sessions.push(s);
-        self.selected = Some(self.sessions.len() - 1);
-        session::save(&self.path, &self.sessions);
+        self.engine.send(Request::Add);
+        self.selected = Some(self.sessions.len());
         cx.notify();
     }
 
-    fn remove(&mut self, i: usize, cx: &mut Context<Self>) {
-        self.sessions.remove(i);
-        if self.sessions.is_empty() {
-            self.selected = None;
-        } else if self.selected.is_some_and(|s| s >= self.sessions.len()) {
-            self.selected = Some(self.sessions.len() - 1);
-        }
-        session::save(&self.path, &self.sessions);
-        cx.notify();
+    fn remove(&mut self, i: usize) {
+        self.engine.send(Request::Remove(i));
     }
 }
 
@@ -72,7 +93,7 @@ impl Render for Root {
                             .text_color(rgb(0x777777))
                             .cursor_pointer()
                             .child("x")
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove(i, cx))),
+                            .on_click(cx.listener(move |this, _, _, _cx| this.remove(i))),
                     )
                     .into_any_element(),
             );
@@ -136,9 +157,22 @@ impl Render for Root {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("headless") {
+        if let Err(e) = engine::run_headless() {
+            eprintln!("jetty: engine error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    run_gui();
+}
+
+fn run_gui() {
     application().run(|cx: &mut App| {
-        let path = session::config_path();
-        let sessions = session::load(&path);
+        gpui_tokio::init(cx);
+        let (engine, mut events) = engine::start_in_process(cx);
+        let root = cx.new(|_| Root::new(engine));
+        let weak = root.downgrade();
         cx.open_window(
             WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {
@@ -152,15 +186,14 @@ fn main() {
                 ))),
                 ..Default::default()
             },
-            move |_window, cx| {
-                let selected = (!sessions.is_empty()).then_some(0);
-                cx.new(|_| Root {
-                    sessions,
-                    selected,
-                    path,
-                })
-            },
+            move |_window, _cx| root.clone(),
         )
         .expect("open window");
+        cx.spawn(async move |cx| {
+            while let Some(event) = events.recv().await {
+                weak.update(cx, |root, cx| root.on_event(event, cx)).ok();
+            }
+        })
+        .detach();
     });
 }

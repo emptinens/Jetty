@@ -54,11 +54,12 @@ pub fn load(path: &Path) -> Vec<Session> {
     }
 }
 
-pub fn save(path: &Path, sessions: &[Session]) {
+pub fn save(path: &Path, sessions: &[Session]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("jetty: cannot create {}: {e}", dir.display());
-            return;
+            let msg = format!("cannot create {}: {e}", dir.display());
+            eprintln!("jetty: {msg}");
+            return Err(msg);
         }
     }
     let file = SessionsFile {
@@ -66,17 +67,41 @@ pub fn save(path: &Path, sessions: &[Session]) {
     };
     match serde_json::to_string_pretty(&file) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(path, json) {
-                eprintln!("jetty: cannot write {}: {e}", path.display());
+            let tmp = path.with_extension("json.tmp");
+            if let Err(e) = std::fs::write(&tmp, &json) {
+                let msg = format!("cannot write {}: {e}", tmp.display());
+                eprintln!("jetty: {msg}");
+                return Err(msg);
             }
+            if let Err(e) = std::fs::File::open(&tmp).and_then(|f| f.sync_all()) {
+                let msg = format!("cannot fsync {}: {e}", tmp.display());
+                eprintln!("jetty: {msg}");
+                let _ = std::fs::remove_file(&tmp);
+                return Err(msg);
+            }
+            if let Err(e) = std::fs::rename(&tmp, path) {
+                let msg = format!(
+                    "cannot rename {} to {}: {e}",
+                    tmp.display(),
+                    path.display()
+                );
+                eprintln!("jetty: {msg}");
+                let _ = std::fs::remove_file(&tmp);
+                return Err(msg);
+            }
+            Ok(())
         }
-        Err(e) => eprintln!("jetty: cannot serialize sessions: {e}"),
+        Err(e) => {
+            let msg = format!("cannot serialize sessions: {e}");
+            eprintln!("jetty: {msg}");
+            Err(msg)
+        }
     }
 }
 
 fn seed(path: &Path) -> Vec<Session> {
     let sessions = vec![default_session()];
-    save(path, &sessions);
+    save(path, &sessions).expect("jetty: failed to seed sessions file");
     sessions
 }
 
@@ -99,7 +124,7 @@ mod tests {
 
         let mut sessions = load(&path);
         sessions[0].name = "agent".into();
-        save(&path, &sessions);
+        save(&path, &sessions).unwrap();
         assert_eq!(load(&path), sessions);
 
         std::fs::write(&path, "{not json").unwrap();
