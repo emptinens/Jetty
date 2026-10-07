@@ -71,3 +71,52 @@ impl Write for EngineWriter {
 
 /// Feeds engine `Output` chunks to a session's reader.
 pub type Feed = Sender<Vec<u8>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{
+        AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled as _, TestAppContext,
+        VisualTestContext, Window, div,
+    };
+    use gpui_terminal::{TerminalConfig, TerminalView};
+
+    struct Harness {
+        terminal: Entity<TerminalView>,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let focus = self.terminal.read(cx).focus_handle().clone();
+            focus.focus(window, cx);
+            div().size_full().child(self.terminal.clone())
+        }
+    }
+
+    #[test]
+    fn typed_text_is_forwarded_to_the_engine() {
+        let mut app = TestAppContext::single();
+        let (requests, mut sent) = tokio::sync::mpsc::unbounded_channel::<Request>();
+        let engine = EngineHandle::from_sender(requests);
+        let (_feed, reader_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let writer = EngineWriter::new(engine, 7);
+        let reader = EventReader::new(reader_rx);
+
+        let window = app.add_window(|_window, cx| {
+            let terminal =
+                cx.new(|cx| TerminalView::new(writer, reader, TerminalConfig::default(), cx));
+            Harness { terminal }
+        });
+
+        let mut cx = VisualTestContext::from_window(window.into(), &app);
+        cx.simulate_input("hey");
+
+        let mut typed = Vec::new();
+        while let Ok(request) = sent.try_recv() {
+            if let Request::Input(7, bytes) = request {
+                typed.extend(bytes);
+            }
+        }
+        assert_eq!(String::from_utf8_lossy(&typed), "hey");
+    }
+}

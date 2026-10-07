@@ -56,6 +56,11 @@ impl EngineHandle {
     pub fn send(&self, request: Request) {
         let _ = self.0.send(request);
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_sender(sender: UnboundedSender<Request>) -> Self {
+        Self(sender)
+    }
 }
 
 pub struct State {

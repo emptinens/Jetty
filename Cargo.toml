@@ -20,3 +20,6 @@ gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "ba8159b4d32
 
 [patch.crates-io]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "ba8159b4d324d137e08993d85fb023b484388ede" }
+
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "ba8159b4d324d137e08993d85fb023b484388ede", features = ["test-support"] }
