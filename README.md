@@ -19,7 +19,7 @@ cargo test             # unit tests
 
 Requirements: Rust 1.99+, Wayland, xkbcommon, Vulkan. The first build clones the pinned Zed revision for `gpui`/`gpui_platform`.
 
-Configuration: one JSON file, `$XDG_CONFIG_HOME/jetty/sessions.json` (fallback `~/.config/jetty/sessions.json`). On first run it is seeded with `shell` in `$HOME`; every session is just a name, a directory, and a command, so any CLI works. A command is split on whitespace into program plus arguments, so quoting is not interpreted: put anything with quotes into a small script and point the command at it.
+Configuration: one JSON file, `$XDG_CONFIG_HOME/jetty/sessions.json` (fallback `~/.config/jetty/sessions.json`). On first run it is seeded with `shell` in `$HOME`; every session is just a name, a directory, and a command, so any CLI works. The command is split into program plus arguments with single and double quotes honored (`/bin/sh -c 'echo hi'` works); there are no shell features beyond that, so pipes and expansions do not apply.
 
 ## Decided, not built yet
 

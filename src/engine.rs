@@ -221,6 +221,46 @@ impl State {
     }
 }
 
+/// Split a command line into program plus arguments, honoring single and double
+/// quotes so `sh -c 'echo hi'` works. An unclosed quote swallows the rest.
+fn split_command(command: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for ch in command.chars() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    started = true;
+                }
+                c if c.is_whitespace() => {
+                    if started || !current.is_empty() {
+                        parts.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                c => {
+                    current.push(c);
+                    started = true;
+                }
+            },
+        }
+    }
+    if started || !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 /// Open a pty, spawn the session command on the slave, launch a reader thread,
 /// and register the writer with the write-handling task so writes never block
 /// the engine loop.
@@ -230,9 +270,9 @@ fn attach_pty(
     pty_events: &UnboundedSender<Event>,
     write_tx: &UnboundedSender<WriteCommand>,
 ) -> Result<SessionRuntime, String> {
-    let mut parts = session.command.split_whitespace();
+    let parts = split_command(&session.command);
     let program = parts
-        .next()
+        .first()
         .ok_or_else(|| format!("attach {id}: empty command"))?;
 
     let pty_system = native_pty_system();
@@ -246,7 +286,7 @@ fn attach_pty(
         .map_err(|e| format!("attach {id}: openpty: {e}"))?;
 
     let mut cmd = CommandBuilder::new(program);
-    for arg in parts {
+    for arg in &parts[1..] {
         cmd.arg(arg);
     }
     cmd.cwd(std::path::PathBuf::from(&session.directory));
@@ -1474,6 +1514,55 @@ mod tests {
                 text.contains("hello world"),
                 "command args must reach the child, got {text:?}"
             );
+        })
+        .await
+        .unwrap();
+        drop(req_tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_splitting_honors_quotes() {
+        let split = |s: &str| split_command(s).join("|");
+        assert_eq!(split("/bin/echo hello world"), "/bin/echo|hello|world");
+        assert_eq!(split("/bin/sh -c 'echo hi there'"), "/bin/sh|-c|echo hi there");
+        assert_eq!(split("/bin/sh -c \"echo hi\""), "/bin/sh|-c|echo hi");
+        assert_eq!(split("  a   b  "), "a|b");
+        assert_eq!(split("/bin/echo ''"), "/bin/echo|");
+        assert_eq!(split("/bin/sh -c 'unclosed"), "/bin/sh|-c|unclosed");
+        assert!(split_command("   ").is_empty());
+    }
+
+    #[tokio::test]
+    async fn quoted_command_arguments_reach_the_child() {
+        let dir = std::env::temp_dir().join(format!("jetty-quoted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = Session {
+            id: 1,
+            name: "quoted".into(),
+            directory: dir.to_string_lossy().into(),
+            command: "/bin/sh -c 'printf quoted-ok'".into(),
+        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
+        let (req_tx, req_rx) = unbounded_channel::<Request>();
+        let (internal_tx, internal_rx) = unbounded_channel::<Event>();
+        let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
+        let _engine = tokio::spawn(run(req_rx, internal_tx, internal_rx, client_tx, state));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let _ = ev_rx.recv().await.unwrap(); // initial Sessions
+            req_tx.send(Request::Attach(1)).unwrap();
+            let mut out = Vec::new();
+            loop {
+                match ev_rx.recv().await.unwrap() {
+                    Event::Output(id, bytes) if id == 1 => out.extend(bytes),
+                    Event::Exited(id) if id == 1 => break,
+                    Event::Error(e) => panic!("unexpected error: {e}"),
+                    _ => {}
+                }
+            }
+            let text = String::from_utf8_lossy(&out);
+            assert!(text.contains("quoted-ok"), "got {text:?}");
         })
         .await
         .unwrap();
