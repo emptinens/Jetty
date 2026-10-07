@@ -23,6 +23,7 @@ struct Root {
     quit_dialog: bool,
     terminals: HashMap<u64, Entity<TerminalView>>,
     feeds: HashMap<u64, Feed>,
+    focus_pending: Option<u64>,
 }
 
 impl Root {
@@ -34,6 +35,7 @@ impl Root {
             quit_dialog: false,
             terminals: HashMap::new(),
             feeds: HashMap::new(),
+            focus_pending: None,
         };
         this.engine.send(Request::Snapshot);
         this
@@ -106,6 +108,7 @@ impl Root {
         });
         self.feeds.insert(id, feed);
         self.terminals.insert(id, view);
+        self.focus_pending = Some(id);
         self.engine.send(Request::Attach(id));
     }
 
@@ -123,7 +126,14 @@ impl Root {
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(id) = self.focus_pending.take() {
+            if let Some(view) = self.terminals.get(&id) {
+                let focus = view.read(cx).focus_handle().clone();
+                focus.focus(window, cx);
+            }
+        }
+
         let mut rows: Vec<AnyElement> = Vec::with_capacity(self.sessions.len());
         for i in 0..self.sessions.len() {
             let selected = self.selected == Some(i);
