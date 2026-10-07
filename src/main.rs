@@ -1,19 +1,21 @@
 use std::collections::HashMap;
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowOptions, div, px, rgb,
-    rgba, size,
+    AnyElement, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
+    WindowOptions, div, px, rgb, rgba, size,
 };
 use gpui_platform::application;
 use gpui_terminal::{TerminalConfig, TerminalView};
 
 mod engine;
+mod form;
 mod protocol;
 mod session;
 mod terminal;
 
-use crate::protocol::{Event, Request};
+use crate::form::{FIELD_LABELS, FormOutcome, NewSessionForm};
+use crate::protocol::{Event, NewSession, Request};
 use crate::terminal::{EngineWriter, EventReader, Feed};
 
 struct Root {
@@ -24,10 +26,13 @@ struct Root {
     terminals: HashMap<u64, Entity<TerminalView>>,
     feeds: HashMap<u64, Feed>,
     focus_pending: Option<u64>,
+    form: Option<NewSessionForm>,
+    form_focus: FocusHandle,
+    form_focus_pending: bool,
 }
 
 impl Root {
-    fn new(engine: engine::EngineHandle) -> Self {
+    fn new(engine: engine::EngineHandle, cx: &mut Context<Self>) -> Self {
         let this = Self {
             sessions: Vec::new(),
             selected: None,
@@ -36,6 +41,9 @@ impl Root {
             terminals: HashMap::new(),
             feeds: HashMap::new(),
             focus_pending: None,
+            form: None,
+            form_focus: cx.focus_handle(),
+            form_focus_pending: false,
         };
         this.engine.send(Request::Snapshot);
         this
@@ -57,6 +65,9 @@ impl Root {
                 self.feeds.retain(|id, _| live.contains(id));
                 if let Some(session) = self.selected.and_then(|i| self.sessions.get(i)).cloned() {
                     self.ensure_terminal(&session, cx);
+                }
+                if self.sessions.is_empty() && self.form.is_none() {
+                    self.open_form(cx);
                 }
                 cx.notify();
             }
@@ -113,9 +124,56 @@ impl Root {
     }
 
     fn add(&mut self, cx: &mut Context<Self>) {
-        self.engine.send(Request::Add);
-        self.selected = Some(self.sessions.len());
+        self.open_form(cx);
+    }
+
+    fn open_form(&mut self, cx: &mut Context<Self>) {
+        self.form = Some(NewSessionForm::with_defaults(
+            session::default_directory(),
+            session::default_command(),
+        ));
+        self.form_focus_pending = true;
         cx.notify();
+    }
+
+    fn on_form_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let outcome = form.handle_event(event);
+        match outcome {
+            FormOutcome::Consumed | FormOutcome::Next => {}
+            FormOutcome::Cancel => {
+                self.form = None;
+                self.refocus_terminal(window, cx);
+            }
+            FormOutcome::Submit => {
+                let (name, directory, command) = form.values();
+                self.form = None;
+                self.engine.send(Request::Add(NewSession {
+                    name,
+                    directory,
+                    command,
+                }));
+                self.selected = Some(self.sessions.len());
+                self.refocus_terminal(window, cx);
+            }
+        }
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn refocus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self
+            .selected
+            .and_then(|i| self.sessions.get(i))
+            .map(|s| s.id)
+        {
+            if let Some(view) = self.terminals.get(&id) {
+                let focus = view.read(cx).focus_handle().clone();
+                focus.focus(window, cx);
+            }
+        }
     }
 
     fn remove(&mut self, i: usize) {
@@ -132,6 +190,10 @@ impl Render for Root {
                 let focus = view.read(cx).focus_handle().clone();
                 focus.focus(window, cx);
             }
+        }
+        if self.form_focus_pending && self.form.is_some() {
+            self.form_focus_pending = false;
+            self.form_focus.focus(window, cx);
         }
 
         let mut rows: Vec<AnyElement> = Vec::with_capacity(self.sessions.len());
@@ -206,6 +268,34 @@ impl Render for Root {
                 .p_4()
                 .children(detail)
                 .into_any_element(),
+        };
+
+        let form_rows: Vec<AnyElement> = match &self.form {
+            Some(form) => {
+                let mut rows = vec![
+                    div()
+                        .text_color(rgb(0x777777))
+                        .child("new session · enter: next/create · esc: cancel")
+                        .into_any_element(),
+                ];
+                for (i, label) in FIELD_LABELS.iter().enumerate() {
+                    let active = form.active == i;
+                    rows.push(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if active { rgb(0x2b3a55) } else { rgb(0x181818) })
+                            .child(div().text_color(rgb(0x888888)).child(*label))
+                            .child(div().child(form.fields[i].value.clone()))
+                            .into_any_element(),
+                    );
+                }
+                rows
+            }
+            None => Vec::new(),
         };
 
         let dialog: Vec<AnyElement> = if self.quit_dialog {
@@ -288,8 +378,11 @@ impl Render for Root {
                     .p_2()
                     .border_r_1()
                     .border_color(rgb(0x2a2a2a))
+                    .track_focus(&self.form_focus)
+                    .on_key_down(cx.listener(Self::on_form_key))
                     .child(div().text_color(rgb(0x777777)).child("sessions"))
                     .children(rows)
+                    .children(form_rows)
                     .child(
                         div()
                             .id("add-session")
@@ -322,7 +415,7 @@ fn run_gui() {
     application().run(|cx: &mut App| {
         gpui_tokio::init(cx);
         let (engine, mut events) = engine::start_in_process(cx);
-        let root = cx.new(|_| Root::new(engine));
+        let root = cx.new(|cx| Root::new(engine, cx));
         let root_for_close = root.clone();
         let weak = root.downgrade();
         let _window = cx

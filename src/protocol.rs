@@ -2,11 +2,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::Session;
 
+/// A session to create; empty fields fall back to the environment defaults.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NewSession {
+    pub name: String,
+    pub directory: String,
+    pub command: String,
+}
+
 /// ids are stable across removals; all target requests address a session by id.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
     Snapshot,
-    Add,
+    Add(NewSession),
     Remove(u64),
     Attach(u64),
     Input(u64, Vec<u8>),

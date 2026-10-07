@@ -30,12 +30,20 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Returns a session with id 0; the engine assigns a real id on Add.
+pub fn default_directory() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+}
+
+pub fn default_command() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
 pub fn default_session() -> Session {
     Session {
         id: 0,
         name: "shell".into(),
-        directory: std::env::var("HOME").unwrap_or_else(|_| "/".into()),
-        command: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+        directory: default_directory(),
+        command: default_command(),
     }
 }
 

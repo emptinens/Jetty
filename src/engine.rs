@@ -129,13 +129,28 @@ impl State {
         let mut changed = false;
         match request {
             Request::Snapshot => {}
-            Request::Add => {
+            Request::Add(new) => {
                 let id = self.next_id;
                 self.next_id += 1;
-                let mut s = session::default_session();
-                s.id = id;
-                s.name = format!("shell {id}");
-                self.sessions.push(s);
+                let defaults = session::default_session();
+                self.sessions.push(Session {
+                    id,
+                    name: if new.name.trim().is_empty() {
+                        format!("shell {id}")
+                    } else {
+                        new.name.trim().to_string()
+                    },
+                    directory: if new.directory.trim().is_empty() {
+                        defaults.directory
+                    } else {
+                        new.directory.trim().to_string()
+                    },
+                    command: if new.command.trim().is_empty() {
+                        defaults.command
+                    } else {
+                        new.command.trim().to_string()
+                    },
+                });
                 changed = true;
             }
             Request::Remove(id) => {
@@ -409,6 +424,7 @@ pub fn run_headless() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::NewSession;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
@@ -447,7 +463,7 @@ mod tests {
         assert_ne!(sid, 0, "seeded session must have a non-zero id");
 
         let (client, pty) = dummy_channels();
-        state.apply(Request::Add, &client, &pty);
+        state.apply(Request::Add(NewSession::default()), &client, &pty);
         assert_eq!(state.sessions.len(), 2);
         assert_eq!(
             state.sessions[1].name,
@@ -478,17 +494,17 @@ mod tests {
         let sid1 = state.sessions[0].id;
         assert_ne!(sid1, 0);
 
-        state.apply(Request::Add, &client, &pty);
+        state.apply(Request::Add(NewSession::default()), &client, &pty);
         let sid2 = state.sessions[1].id;
         assert_ne!(sid2, sid1);
 
-        state.apply(Request::Add, &client, &pty);
+        state.apply(Request::Add(NewSession::default()), &client, &pty);
         assert_eq!(state.sessions.len(), 3);
 
         state.apply(Request::Remove(sid2), &client, &pty);
         assert_eq!(state.sessions.len(), 2);
         // Add again; new id must be unique and not reuse the removed id
-        state.apply(Request::Add, &client, &pty);
+        state.apply(Request::Add(NewSession::default()), &client, &pty);
         assert_eq!(state.sessions.len(), 3);
         let ids: Vec<u64> = state.sessions.iter().map(|s| s.id).collect();
         let mut uniq = ids.clone();
@@ -531,7 +547,7 @@ mod tests {
         let engine = tokio::spawn(run(request_rx, internal_tx, internal_rx, client_tx, state));
 
         assert_eq!(names(events.recv().await.unwrap()), "shell");
-        requests.send(Request::Add).unwrap();
+        requests.send(Request::Add(NewSession::default())).unwrap();
         // second session gets id-2 name "shell 2" (seeded session has id 1)
         let ev = events.recv().await.unwrap();
         let list = match &ev {
@@ -596,7 +612,7 @@ mod tests {
         let engine = tokio::spawn(run(request_rx, internal_tx, internal_rx, client_tx, state));
 
         let _ = events.recv().await.unwrap();
-        requests.send(Request::Add).unwrap();
+        requests.send(Request::Add(NewSession::default())).unwrap();
 
         // Add triggers a save; the save fails, so we get an Error + Sessions pair
         let (mut saw_error, mut saw_sessions) = (false, false);
@@ -644,7 +660,7 @@ mod tests {
         let _ = events.recv().await.unwrap();
 
         // (a) Add triggers save; save fails -> Error + Sessions. In-memory state grew.
-        requests.send(Request::Add).unwrap();
+        requests.send(Request::Add(NewSession::default())).unwrap();
         let (mut saw_error, mut saw_sessions) = (false, false);
         for _ in 0..2 {
             match events.recv().await.unwrap() {
@@ -1258,7 +1274,7 @@ mod tests {
             assert_eq!(initial[0].id, 1);
 
             // --- Step 1: Add (creates a default shell session) ---
-            req_tx.send(Request::Add).unwrap();
+            req_tx.send(Request::Add(NewSession::default())).unwrap();
             let ev = ev_rx.recv().await.unwrap();
             let after_add = match &ev {
                 Event::Sessions(l) => l.clone(),
@@ -1383,7 +1399,7 @@ mod tests {
             }
 
             // --- Step 5: engine is still alive after Remove (requirement 5) ---
-            req_tx.send(Request::Add).unwrap();
+            req_tx.send(Request::Add(NewSession::default())).unwrap();
             let ev = tokio::time::timeout(Duration::from_secs(3), ev_rx.recv())
                 .await
                 .unwrap()
