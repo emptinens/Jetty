@@ -46,7 +46,7 @@ impl Root {
                 eprintln!("jetty: engine error: {msg}");
             }
             Event::Output(_, _) => {} // stub: terminal output in next node
-            Event::Exited(_) => {} // stub: terminal exit in next node
+            Event::Exited(_) => {}    // stub: terminal exit in next node
         }
     }
 
@@ -82,7 +82,11 @@ impl Render for Root {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(if selected { rgb(0x2b3a55) } else { rgb(0x1b1b1b) })
+                    .bg(if selected {
+                        rgb(0x2b3a55)
+                    } else {
+                        rgb(0x1b1b1b)
+                    })
                     .child(
                         div()
                             .id(("session-row", i))
@@ -139,10 +143,9 @@ impl Render for Root {
                             .bg(rgb(0x2a2a2a))
                             .child(div().text_lg().child("Quit Jetty?"))
                             .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child("Sessions will keep running if you choose 'Leave Running'."),
+                                div().text_sm().text_color(rgb(0x9a9a9a)).child(
+                                    "Sessions will keep running if you choose 'Leave Running'.",
+                                ),
                             )
                             .child(
                                 div()
@@ -246,40 +249,41 @@ fn run_gui() {
         let root = cx.new(|_| Root::new(engine));
         let root_for_close = root.clone();
         let weak = root.downgrade();
-        let _window = cx.open_window(
-            WindowOptions {
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Jetty".into()),
+        let _window = cx
+            .open_window(
+                WindowOptions {
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Jetty".into()),
+                        ..Default::default()
+                    }),
+                    window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(1100.), px(700.)),
+                        cx,
+                    ))),
                     ..Default::default()
-                }),
-                window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1100.), px(700.)),
-                    cx,
-                ))),
-                ..Default::default()
-            },
-            move |window, cx| {
-                window.on_window_should_close(cx, {
-                    let root = root_for_close.clone();
-                    move |_window, app| {
-                        root.update(app, |root, cx| {
-                            if root.quit_dialog {
-                                // dialog already resolved, allow close
-                                true
-                            } else {
-                                // first close attempt, show dialog
-                                root.quit_dialog = true;
-                                cx.notify();
-                                false
-                            }
-                        })
-                    }
-                });
-                root
-            },
-        )
-        .expect("open window");
+                },
+                move |window, cx| {
+                    window.on_window_should_close(cx, {
+                        let root = root_for_close.clone();
+                        move |_window, app| {
+                            root.update(app, |root, cx| {
+                                if root.quit_dialog {
+                                    // dialog already resolved, allow close
+                                    true
+                                } else {
+                                    // first close attempt, show dialog
+                                    root.quit_dialog = true;
+                                    cx.notify();
+                                    false
+                                }
+                            })
+                        }
+                    });
+                    root
+                },
+            )
+            .expect("open window");
         cx.spawn(async move |cx| {
             while let Some(event) = events.recv().await {
                 weak.update(cx, |root, cx| root.on_event(event, cx)).ok();

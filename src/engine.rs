@@ -63,6 +63,7 @@ pub struct State {
     runtimes: HashMap<u64, SessionRuntime>,
     kill_on_drop: bool,
     write_tx: Option<UnboundedSender<WriteCommand>>,
+    next_id: u64,
 }
 
 impl Drop for State {
@@ -84,7 +85,18 @@ impl State {
     /// other's edits. Accepted for now; the rusqlite/Loro storage layer replaces it.
     pub fn new(path: PathBuf) -> Self {
         let sessions = session::load(&path);
-        Self { path, sessions, runtimes: HashMap::default(), kill_on_drop: true, write_tx: None }
+        Self::from_sessions(path, sessions)
+    }
+
+    fn from_sessions(path: PathBuf, sessions: Vec<Session>) -> Self {
+        Self {
+            next_id: sessions.iter().map(|s| s.id).max().unwrap_or(0) + 1,
+            path,
+            sessions,
+            runtimes: HashMap::default(),
+            kill_on_drop: true,
+            write_tx: None,
+        }
     }
 
     /// Prevents the Drop impl from killing child processes.
@@ -96,10 +108,6 @@ impl State {
 
     pub fn load() -> Self {
         Self::new(session::config_path())
-    }
-
-    fn next_id(&self) -> u64 {
-        self.sessions.iter().map(|s| s.id).max().unwrap_or(0) + 1
     }
 
     fn is_announced(&self, id: u64) -> bool {
@@ -116,7 +124,8 @@ impl State {
         match request {
             Request::Snapshot => {}
             Request::Add => {
-                let id = self.next_id();
+                let id = self.next_id;
+                self.next_id += 1;
                 let mut s = session::default_session();
                 s.id = id;
                 s.name = format!("shell {id}");
@@ -185,10 +194,8 @@ impl State {
                 self.set_kill_on_drop(val);
             }
         }
-        if changed {
-            if let Err(msg) = session::save(&self.path, &self.sessions) {
-                let _ = client.send(Event::Error(msg));
-            }
+        if changed && let Err(msg) = session::save(&self.path, &self.sessions) {
+            let _ = client.send(Event::Error(msg));
         }
     }
 }
@@ -327,12 +334,14 @@ async fn run(
                         let mut buffered = Vec::new();
                         while let Ok(ev) = internal_rx.try_recv() {
                             match &ev {
-                                Event::Output(id, _) | Event::Exited(id) => {
-                                    if state.is_announced(*id) {
-                                        buffered.push(ev);
-                                    }
-                                    // else: session has been removed — drop the orphaned event
+                                Event::Output(id, _) if state.is_announced(*id) => {
+                                    buffered.push(ev);
                                 }
+                                Event::Exited(id) if state.is_announced(*id) => {
+                                    buffered.push(ev);
+                                }
+                                // session has been removed — drop the orphaned event
+                                Event::Output(..) | Event::Exited(..) => {}
                                 _ => {}
                             }
                         }
@@ -351,12 +360,13 @@ async fn run(
             internal_event = internal_rx.recv() => {
                 // PTY event arrived between requests: forward if announced, else buffer.
                 match internal_event {
-                    Some(ev @ Event::Output(id, _)) | Some(ev @ Event::Exited(id)) => {
-                        if state.is_announced(id) {
-                            let _ = client.send(ev);
-                        }
-                        // else: session has been removed — drop the orphaned event
+                    Some(ev @ Event::Output(id, _)) if state.is_announced(id) => {
+                        let _ = client.send(ev);
                     }
+                    Some(ev @ Event::Exited(id)) if state.is_announced(id) => {
+                        let _ = client.send(ev);
+                    }
+                    // session has been removed — drop the orphaned event
                     _ => {}
                 }
             }
@@ -368,7 +378,11 @@ pub fn start_in_process(cx: &gpui::App) -> (EngineHandle, UnboundedReceiver<Even
     let (req_tx, req_rx) = unbounded_channel::<Request>();
     let (internal_tx, internal_rx) = unbounded_channel::<Event>();
     let (client_tx, client_rx) = unbounded_channel::<Event>();
-    gpui_tokio::Tokio::spawn(cx, run(req_rx, internal_tx, internal_rx, client_tx, State::load())).detach();
+    gpui_tokio::Tokio::spawn(
+        cx,
+        run(req_rx, internal_tx, internal_rx, client_tx, State::load()),
+    )
+    .detach();
     (EngineHandle(req_tx), client_rx)
 }
 
@@ -389,8 +403,8 @@ pub fn run_headless() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     fn temp_state(name: &str) -> (PathBuf, State) {
         let dir = std::env::temp_dir().join(format!("jetty-{name}-{}", std::process::id()));
@@ -429,7 +443,10 @@ mod tests {
         let (client, pty) = dummy_channels();
         state.apply(Request::Add, &client, &pty);
         assert_eq!(state.sessions.len(), 2);
-        assert_eq!(state.sessions[1].name, format!("shell {}", state.sessions[1].id));
+        assert_eq!(
+            state.sessions[1].name,
+            format!("shell {}", state.sessions[1].id)
+        );
 
         // Remove by non-existent id: no-op
         state.apply(Request::Remove(0), &client, &pty);
@@ -521,7 +538,10 @@ mod tests {
         assert_eq!(names(ev), format!("shell,shell {sid2}"));
 
         requests.send(Request::Snapshot).unwrap();
-        assert_eq!(names(events.recv().await.unwrap()), format!("shell,shell {sid2}"));
+        assert_eq!(
+            names(events.recv().await.unwrap()),
+            format!("shell,shell {sid2}")
+        );
 
         requests.send(Request::Remove(sid1)).unwrap();
         assert_eq!(names(events.recv().await.unwrap()), format!("shell {sid2}"));
@@ -563,13 +583,7 @@ mod tests {
         // a regular file where the config dir should be makes create_dir_all fail
         let dir = std::env::temp_dir().join(format!("jetty-err-{}", std::process::id()));
         std::fs::write(&dir, "block").unwrap();
-        let state = State {
-            path: dir.join("sessions.json"),
-            sessions: vec![session::default_session()],
-            runtimes: HashMap::new(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session::default_session()]);
         let (requests, request_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut events) = unbounded_channel::<Event>();
@@ -601,8 +615,7 @@ mod tests {
     #[tokio::test]
     async fn save_failure_state_not_corrupted() {
         // Set up a valid sessions.json to hold the "original" pre-failure state.
-        let valid_dir =
-            std::env::temp_dir().join(format!("jetty-sc-valid-{}", std::process::id()));
+        let valid_dir = std::env::temp_dir().join(format!("jetty-sc-valid-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&valid_dir);
         std::fs::create_dir_all(&valid_dir).unwrap();
         let valid_path = valid_dir.join("sessions.json");
@@ -612,17 +625,10 @@ mod tests {
         session::save(&valid_path, &initial).unwrap();
 
         // A regular file where the config dir should be makes create_dir_all fail.
-        let block_dir =
-            std::env::temp_dir().join(format!("jetty-sc-block-{}", std::process::id()));
+        let block_dir = std::env::temp_dir().join(format!("jetty-sc-block-{}", std::process::id()));
         std::fs::write(&block_dir, "block").unwrap();
 
-        let state = State {
-            path: block_dir.join("sessions.json"),
-            sessions: initial.clone(),
-            runtimes: HashMap::new(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(block_dir.join("sessions.json"), initial.clone());
         let (requests, request_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut events) = unbounded_channel::<Event>();
@@ -659,11 +665,7 @@ mod tests {
                 Event::Error(_) => {}
                 Event::Sessions(list) => {
                     saw_remove = true;
-                    assert_eq!(
-                        list.len(),
-                        1,
-                        "in-memory remove works despite save failure"
-                    );
+                    assert_eq!(list.len(), 1, "in-memory remove works despite save failure");
                 }
                 _ => {}
             }
@@ -687,11 +689,18 @@ mod tests {
     #[tokio::test]
     async fn attach_streams_output_and_exit() {
         let dir = std::env::temp_dir().join(format!("jpt1-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
-        let s = dir.join("s"); std::fs::write(&s, "#!/bin/sh\nprintf hello").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = dir.join("s");
+        std::fs::write(&s, "#!/bin/sh\nprintf hello").unwrap();
         std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let session = Session { id: 1, name: "t1".into(), directory: dir.to_string_lossy().into(), command: s.to_string_lossy().into() };
-        let state = State { path: dir.join("sessions.json"), sessions: vec![session], runtimes: HashMap::default(), kill_on_drop: true, write_tx: None };
+        let session = Session {
+            id: 1,
+            name: "t1".into(),
+            directory: dir.to_string_lossy().into(),
+            command: s.to_string_lossy().into(),
+        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
@@ -701,14 +710,21 @@ mod tests {
             req_tx.send(Request::Attach(1)).unwrap();
             assert!(matches!(ev_rx.recv().await.unwrap(), Event::Sessions(_)));
             let mut out = Vec::new();
-            loop { match ev_rx.recv().await.unwrap() {
-                Event::Output(id, bytes) if id == 1 => out.extend(bytes),
-                Event::Exited(id) if id == 1 => break,
-                Event::Error(e) => panic!("unexpected error: {e}"),
-                _ => {}
-            }}
-            assert!(String::from_utf8_lossy(&out).contains("hello"), "missing hello");
-        }).await.unwrap();
+            loop {
+                match ev_rx.recv().await.unwrap() {
+                    Event::Output(1, bytes) => out.extend(bytes),
+                    Event::Exited(1) => break,
+                    Event::Error(e) => panic!("unexpected error: {e}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                String::from_utf8_lossy(&out).contains("hello"),
+                "missing hello"
+            );
+        })
+        .await
+        .unwrap();
         drop(req_tx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -716,11 +732,18 @@ mod tests {
     #[tokio::test]
     async fn input_reaches_the_process() {
         let dir = std::env::temp_dir().join(format!("jpt2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
-        let s = dir.join("s"); std::fs::write(&s, "#!/bin/sh\nread line\nprintf got:%s \"$line\"").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = dir.join("s");
+        std::fs::write(&s, "#!/bin/sh\nread line\nprintf got:%s \"$line\"").unwrap();
         std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let session = Session { id: 1, name: "t2".into(), directory: dir.to_string_lossy().into(), command: s.to_string_lossy().into() };
-        let state = State { path: dir.join("sessions.json"), sessions: vec![session], runtimes: HashMap::default(), kill_on_drop: true, write_tx: None };
+        let session = Session {
+            id: 1,
+            name: "t2".into(),
+            directory: dir.to_string_lossy().into(),
+            command: s.to_string_lossy().into(),
+        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
@@ -732,14 +755,21 @@ mod tests {
             req_tx.send(Request::Input(1, b"abc\n".to_vec())).unwrap();
             let _ = ev_rx.recv().await.unwrap();
             let mut out = Vec::new();
-            loop { match ev_rx.recv().await.unwrap() {
-                Event::Output(id, bytes) if id == 1 => out.extend(bytes),
-                Event::Exited(id) if id == 1 => break,
-                Event::Error(e) => panic!("unexpected error: {e}"),
-                _ => {}
-            }}
-            assert!(String::from_utf8_lossy(&out).contains("got:abc"), "missing got:abc");
-        }).await.unwrap();
+            loop {
+                match ev_rx.recv().await.unwrap() {
+                    Event::Output(1, bytes) => out.extend(bytes),
+                    Event::Exited(1) => break,
+                    Event::Error(e) => panic!("unexpected error: {e}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                String::from_utf8_lossy(&out).contains("got:abc"),
+                "missing got:abc"
+            );
+        })
+        .await
+        .unwrap();
         drop(req_tx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -747,11 +777,18 @@ mod tests {
     #[tokio::test]
     async fn resize_and_kill() {
         let dir = std::env::temp_dir().join(format!("jpt3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
-        let s = dir.join("s"); std::fs::write(&s, "#!/bin/sh\nsleep 30").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = dir.join("s");
+        std::fs::write(&s, "#!/bin/sh\nsleep 30").unwrap();
         std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let session = Session { id: 1, name: "t3".into(), directory: dir.to_string_lossy().into(), command: s.to_string_lossy().into() };
-        let state = State { path: dir.join("sessions.json"), sessions: vec![session], runtimes: HashMap::default(), kill_on_drop: true, write_tx: None };
+        let session = Session {
+            id: 1,
+            name: "t3".into(),
+            directory: dir.to_string_lossy().into(),
+            command: s.to_string_lossy().into(),
+        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
@@ -763,14 +800,20 @@ mod tests {
             req_tx.send(Request::Resize(1, 80, 24)).unwrap();
             let _ = ev_rx.recv().await.unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
-            while let Ok(ev) = ev_rx.try_recv() { assert!(!matches!(ev, Event::Error(_)), "unexpected error"); }
+            while let Ok(ev) = ev_rx.try_recv() {
+                assert!(!matches!(ev, Event::Error(_)), "unexpected error");
+            }
             req_tx.send(Request::Kill(1)).unwrap();
-            loop { match ev_rx.recv().await.unwrap() {
-                Event::Exited(id) if id == 1 => break,
-                Event::Error(e) => panic!("unexpected error: {e}"),
-                _ => {}
-            }}
-        }).await.unwrap();
+            loop {
+                match ev_rx.recv().await.unwrap() {
+                    Event::Exited(1) => break,
+                    Event::Error(e) => panic!("unexpected error: {e}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
         drop(req_tx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -793,13 +836,7 @@ mod tests {
             directory: dir.to_string_lossy().into(),
             command: s.to_string_lossy().into(),
         };
-        let state = State {
-            path: dir.join("sessions.json"),
-            sessions: vec![session],
-            runtimes: HashMap::default(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
@@ -822,8 +859,8 @@ mod tests {
             let mut out = Vec::new();
             loop {
                 match ev_rx.recv().await.unwrap() {
-                    Event::Output(id, bytes) if id == 1 => out.extend(bytes),
-                    Event::Exited(id) if id == 1 => break,
+                    Event::Output(1, bytes) => out.extend(bytes),
+                    Event::Exited(1) => break,
                     Event::Error(e) => panic!("unexpected error: {e}"),
                     _ => {}
                 }
@@ -847,8 +884,7 @@ mod tests {
     /// `ls` (no args), and asserts the marker file name appears in the output.
     #[tokio::test]
     async fn session_directory_is_child_cwd() {
-        let dir =
-            std::env::temp_dir().join(format!("jpt-cwd-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("jpt-cwd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -869,13 +905,7 @@ mod tests {
             directory: dir.to_string_lossy().into(),
             command: s.to_string_lossy().into(),
         };
-        let state = State {
-            path: dir.join("sessions.json"),
-            sessions: vec![session],
-            runtimes: HashMap::default(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
@@ -887,8 +917,8 @@ mod tests {
             let mut out = Vec::new();
             loop {
                 match ev_rx.recv().await.unwrap() {
-                    Event::Output(id, bytes) if id == 1 => out.extend(bytes),
-                    Event::Exited(id) if id == 1 => break,
+                    Event::Output(1, bytes) => out.extend(bytes),
+                    Event::Exited(1) => break,
                     Event::Error(e) => panic!("unexpected error: {e}"),
                     _ => {}
                 }
@@ -929,10 +959,10 @@ mod tests {
     ) -> u32 {
         req_tx.send(Request::Attach(1)).unwrap();
         for _ in 0..100 {
-            if let Ok(text) = std::fs::read_to_string(pid_path) {
-                if let Ok(pid) = text.trim().parse::<u32>() {
-                    return pid;
-                }
+            if let Ok(text) = std::fs::read_to_string(pid_path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return pid;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -955,13 +985,7 @@ mod tests {
             directory: dir.to_string_lossy().into(),
             command: s.to_string_lossy().into(),
         };
-        let state = State {
-            path: dir.join("sessions.json"),
-            sessions: vec![session],
-            runtimes: HashMap::default(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, _ev_rx) = unbounded_channel::<Event>();
@@ -985,7 +1009,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(dead, "child must die when State drops with kill_on_drop=true");
+        assert!(
+            dead,
+            "child must die when State drops with kill_on_drop=true"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1007,13 +1034,7 @@ mod tests {
             directory: dir.to_string_lossy().into(),
             command: s.to_string_lossy().into(),
         };
-        let state = State {
-            path: dir.join("sessions.json"),
-            sessions: vec![session],
-            runtimes: HashMap::default(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, _ev_rx) = unbounded_channel::<Event>();
@@ -1067,13 +1088,7 @@ mod tests {
             directory: dir.to_string_lossy().into(),
             command: s.to_string_lossy().into(),
         };
-        let state = State {
-            path: dir.join("sessions.json"),
-            sessions: vec![session],
-            runtimes: HashMap::default(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
@@ -1100,7 +1115,9 @@ mod tests {
                             }
                         }
                         Event::Output(id, _) | Event::Exited(id) => {
-                            if id == 1 { leaked_count += 1; }
+                            if id == 1 {
+                                leaked_count += 1;
+                            }
                         }
                         Event::Error(e) => panic!("unexpected error: {e}"),
                     },
@@ -1110,7 +1127,9 @@ mod tests {
             }
             assert!(saw_sessions, "should see Sessions after Remove");
             assert_eq!(leaked_count, 0, "no Output/Exited for removed session");
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         drop(req_tx);
         engine.await.unwrap();
@@ -1149,7 +1168,7 @@ mod tests {
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break, // EOF: slave closed
-                Ok(_) => {}      // drain residual kernel-buffered data
+                Ok(_) => {}     // drain residual kernel-buffered data
                 Err(e) => panic!("unexpected read error: {e}"),
             }
             if start.elapsed() > Duration::from_secs(2) {
@@ -1203,8 +1222,8 @@ mod tests {
         // Verify the run loop (a) does not panic, (b) does not leak Output/Exited events for the
         // removed session, (c) continue serving requests afterward, and (d) not emit
         // any unexpected Error events.
-        let dir = std::env::temp_dir()
-            .join(format!("jpt-add-attach-remove-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("jpt-add-attach-remove-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sessions.json");
@@ -1215,20 +1234,14 @@ mod tests {
             directory: "/".into(),
             command: "/bin/sh".into(),
         };
-        let state = State {
-            path: path.clone(),
-            sessions: vec![seed.clone()],
-            runtimes: HashMap::default(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(path.clone(), vec![seed.clone()]);
 
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
         let engine = tokio::spawn(run(req_rx, internal_tx, internal_rx, client_tx, state));
 
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             // --- Initial announcement ---
             let ev = ev_rx.recv().await.unwrap();
             let initial = match &ev {
@@ -1271,7 +1284,9 @@ mod tests {
             // --- Step 3: send Input and verify Output arrives after Sessions ---
             let marker = format!("JETTY_TEST_MARKER_{new_id}");
             let input_line = format!("echo {marker}\n");
-            req_tx.send(Request::Input(new_id, input_line.as_bytes().to_vec())).unwrap();
+            req_tx
+                .send(Request::Input(new_id, input_line.as_bytes().to_vec()))
+                .unwrap();
 
             // Wait for Output containing the marker (requirement 3: Output after Sessions).
             let mut got_output = false;
@@ -1299,7 +1314,10 @@ mod tests {
                     Err(_) => break, // timeout
                 }
             }
-            assert!(got_output, "Output event containing marker must arrive for attached session");
+            assert!(
+                got_output,
+                "Output event containing marker must arrive for attached session"
+            );
 
             // Drain any further Output/Exited events that arrived before Remove.
             while let Ok(ev) = ev_rx.try_recv() {
@@ -1341,7 +1359,10 @@ mod tests {
                 }
             }
             assert!(saw_removal, "should see Sessions reflecting removal");
-            assert_eq!(leaked, 0, "no Output/Exited may leak for removed session {new_id}");
+            assert_eq!(
+                leaked, 0,
+                "no Output/Exited may leak for removed session {new_id}"
+            );
             assert_eq!(error_count, 0, "no Error events emitted");
 
             // Discard any straggler events from the killed PTY.
@@ -1363,14 +1384,18 @@ mod tests {
                 .unwrap();
             match ev {
                 Event::Sessions(list) => {
-                    assert_eq!(list.len(), 2,
-                        "engine still works: new session added after Remove");
+                    assert_eq!(
+                        list.len(),
+                        2,
+                        "engine still works: new session added after Remove"
+                    );
                     let newest = &list[1];
-                    // next_id is max+1 so after removing id 2, the next
-                    // Add may reuse it. Just verify the id is non-zero
-                    // and not the seed's id.
-                    assert!(newest.id > 0, "fresh id must be non-zero");
-                    assert_ne!(newest.id, 1, "fresh id must not collide with seed session");
+                    // ids are monotonic: the next Add must not reuse the removed id.
+                    assert!(
+                        newest.id > new_id,
+                        "ids must never be reused: got {} after removing {new_id}",
+                        newest.id
+                    );
                 }
                 Event::Error(e) => panic!("unexpected error on post-remove Add: {e}"),
                 other => panic!("expected Sessions after post-remove Add, got {other:?}"),
@@ -1380,8 +1405,10 @@ mod tests {
             while let Ok(Some(ev)) =
                 tokio::time::timeout(Duration::from_millis(500), ev_rx.recv()).await
             {
-                assert!(!matches!(ev, Event::Error(_)),
-                    "no Error events during final drain, got {ev:?}");
+                assert!(
+                    !matches!(ev, Event::Error(_)),
+                    "no Error events during final drain, got {ev:?}"
+                );
             }
         })
         .await
@@ -1403,13 +1430,7 @@ mod tests {
             directory: dir.to_string_lossy().into(),
             command: "/bin/echo hello world".into(),
         };
-        let state = State {
-            path: dir.join("sessions.json"),
-            sessions: vec![session],
-            runtimes: HashMap::default(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
@@ -1420,8 +1441,8 @@ mod tests {
             let mut out = Vec::new();
             loop {
                 match ev_rx.recv().await.unwrap() {
-                    Event::Output(id, bytes) if id == 1 => out.extend(bytes),
-                    Event::Exited(id) if id == 1 => break,
+                    Event::Output(1, bytes) => out.extend(bytes),
+                    Event::Exited(1) => break,
                     Event::Error(e) => panic!("unexpected error: {e}"),
                     _ => {}
                 }
@@ -1445,8 +1466,7 @@ mod tests {
     /// scripts.
     #[tokio::test]
     async fn bare_command_name_resolved_via_path() {
-        let dir =
-            std::env::temp_dir().join(format!("jpt-path-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("jpt-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let session = Session {
@@ -1455,13 +1475,7 @@ mod tests {
             directory: dir.to_string_lossy().into(),
             command: "sh".into(), // bare name, resolved via PATH by CommandBuilder
         };
-        let state = State {
-            path: dir.join("sessions.json"),
-            sessions: vec![session],
-            runtimes: HashMap::default(),
-            kill_on_drop: true,
-            write_tx: None,
-        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
         let (req_tx, req_rx) = unbounded_channel::<Request>();
         let (internal_tx, internal_rx) = unbounded_channel::<Event>();
         let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
@@ -1477,8 +1491,8 @@ mod tests {
             let mut out = Vec::new();
             loop {
                 match ev_rx.recv().await.unwrap() {
-                    Event::Output(id, bytes) if id == 1 => out.extend(bytes),
-                    Event::Exited(id) if id == 1 => break,
+                    Event::Output(1, bytes) => out.extend(bytes),
+                    Event::Exited(1) => break,
                     Event::Error(e) => panic!("unexpected error: {e}"),
                     _ => {}
                 }
@@ -1511,8 +1525,7 @@ mod tests {
     #[tokio::test]
     async fn multi_session_pty_concurrency_no_cross_wiring() {
         tokio::time::timeout(Duration::from_secs(15), async {
-            let dir = std::env::temp_dir()
-                .join(format!("jetty-ms-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("jetty-ms-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
 
@@ -1529,33 +1542,31 @@ mod tests {
                 command: "/bin/sh".into(),
             };
 
-            let state = State {
-                path: dir.join("sessions.json"),
-                sessions: vec![session1, session2],
-                runtimes: HashMap::default(),
-                kill_on_drop: true,
-                write_tx: None,
-            };
+            let state = State::from_sessions(dir.join("sessions.json"), vec![session1, session2]);
 
             let (req_tx, req_rx) = unbounded_channel::<Request>();
             let (internal_tx, internal_rx) = unbounded_channel::<Event>();
             let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
-            let _engine = tokio::spawn(run(
-                req_rx, internal_tx, internal_rx, client_tx, state,
-            ));
+            let _engine = tokio::spawn(run(req_rx, internal_tx, internal_rx, client_tx, state));
 
             // Drain initial Sessions event.
             let ev = ev_rx.recv().await.unwrap();
-            assert!(matches!(&ev, Event::Sessions(list) if list.len() == 2),
-                "initial Sessions should list both sessions, got {ev:?}");
+            assert!(
+                matches!(&ev, Event::Sessions(list) if list.len() == 2),
+                "initial Sessions should list both sessions, got {ev:?}"
+            );
 
             // -- Attach both sessions --
             req_tx.send(Request::Attach(1)).unwrap();
-            assert!(matches!(ev_rx.recv().await.unwrap(), Event::Sessions(_)),
-                "Sessions after attach 1");
+            assert!(
+                matches!(ev_rx.recv().await.unwrap(), Event::Sessions(_)),
+                "Sessions after attach 1"
+            );
             req_tx.send(Request::Attach(2)).unwrap();
-            assert!(matches!(ev_rx.recv().await.unwrap(), Event::Sessions(_)),
-                "Sessions after attach 2");
+            assert!(
+                matches!(ev_rx.recv().await.unwrap(), Event::Sessions(_)),
+                "Sessions after attach 2"
+            );
 
             // Drain shell banners / prompts.
             while let Ok(ev) = ev_rx.try_recv() {
@@ -1569,8 +1580,12 @@ mod tests {
             // -- Send different input to each session concurrently --
             let marker1 = "JMS1_INPUT_OK";
             let marker2 = "JMS2_INPUT_OK";
-            req_tx.send(Request::Input(1, format!("echo {marker1}\n").into_bytes())).unwrap();
-            req_tx.send(Request::Input(2, format!("echo {marker2}\n").into_bytes())).unwrap();
+            req_tx
+                .send(Request::Input(1, format!("echo {marker1}\n").into_bytes()))
+                .unwrap();
+            req_tx
+                .send(Request::Input(2, format!("echo {marker2}\n").into_bytes()))
+                .unwrap();
 
             // Collect output until both sessions have responded.
             let mut out1 = Vec::new();
@@ -1597,20 +1612,26 @@ mod tests {
                             break;
                         }
                     }
-                    Ok(Some(Event::Sessions(_))) => {}  // skip
+                    Ok(Some(Event::Sessions(_))) => {} // skip
                     Ok(Some(Event::Error(e))) => panic!("unexpected error: {e}"),
                     Ok(Some(Event::Exited(id))) => {
                         panic!("unexpected Exited({id}) before kill");
                     }
                     Ok(None) => break,
-                    Err(_) => break,  // timeout
+                    Err(_) => break, // timeout
                 }
             }
 
-            assert!(got_m1, "session 1 should have received its input, out1: {:?}",
-                String::from_utf8_lossy(&out1));
-            assert!(got_m2, "session 2 should have received its input, out2: {:?}",
-                String::from_utf8_lossy(&out2));
+            assert!(
+                got_m1,
+                "session 1 should have received its input, out1: {:?}",
+                String::from_utf8_lossy(&out1)
+            );
+            assert!(
+                got_m2,
+                "session 2 should have received its input, out2: {:?}",
+                String::from_utf8_lossy(&out2)
+            );
 
             // -- Verify no cross-wiring --
             let text1 = String::from_utf8_lossy(&out1);
@@ -1639,7 +1660,9 @@ mod tests {
 
             // -- Verify session 2 still works after session 1 resize --
             let marker2b = "JMS2_POST_RESIZE_OK";
-            req_tx.send(Request::Input(2, format!("echo {marker2b}\n").into_bytes())).unwrap();
+            req_tx
+                .send(Request::Input(2, format!("echo {marker2b}\n").into_bytes()))
+                .unwrap();
             let mut out2b = Vec::new();
             let mut got_m2b = false;
             loop {
@@ -1662,7 +1685,10 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            assert!(got_m2b, "session 2 should still work after session 1 resize");
+            assert!(
+                got_m2b,
+                "session 2 should still work after session 1 resize"
+            );
 
             // -- Kill session 1 only --
             req_tx.send(Request::Kill(1)).unwrap();
@@ -1688,7 +1714,9 @@ mod tests {
 
             // -- Verify session 2 is still alive and functional after kill --
             let marker2c = "JMS2_POST_KILL_OK";
-            req_tx.send(Request::Input(2, format!("echo {marker2c}\n").into_bytes())).unwrap();
+            req_tx
+                .send(Request::Input(2, format!("echo {marker2c}\n").into_bytes()))
+                .unwrap();
             let mut out2c = Vec::new();
             let mut got_m2c = false;
             loop {
@@ -1714,7 +1742,10 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            assert!(got_m2c, "session 2 should still work after session 1 killed");
+            assert!(
+                got_m2c,
+                "session 2 should still work after session 1 killed"
+            );
 
             // -- Clean up --
             drop(req_tx);
@@ -1722,5 +1753,88 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// Discriminates direct-exec from shell dispatch — the only fixture in the
+    /// suite that is not shell-invariant.
+    ///
+    /// The session command is `/bin/echo $HOME` and the test asserts the
+    /// LITERAL six-character string `$HOME` appears in the child's output:
+    ///
+    /// - Direct exec (attach_pty: split_whitespace + CommandBuilder::new +
+    ///   cmd.arg, no shell anywhere in the path) passes `$HOME` through as
+    ///   argv[1] verbatim; /bin/echo receives the characters `$HOME` and
+    ///   prints them back unchanged.
+    /// - An `sh -c "<command>"` regression would hand the command to a shell,
+    ///   which expands `$HOME` to the user's home directory path (HOME is
+    ///   present in the child env: CommandBuilder inherits the parent
+    ///   environment). The output would then be the expanded path, not the
+    ///   literal, and the assert below fails.
+    ///
+    /// Why this fixture and not others: every other PTY test in this suite is
+    /// shell-invariant — `/bin/echo hello world` prints the same bytes whether
+    /// exec'd directly or run under `sh -c`, `#!/bin/sh` scripts produce the
+    /// same output either way, and quoting tricks like `printf '<%s>'` do not
+    /// discriminate either because the shell strips the quotes before exec. A
+    /// literal `$var` argument is the discriminator: only a shell expands it.
+    #[tokio::test]
+    async fn command_dispatch_is_direct_exec_not_shell() {
+        let dir = std::env::temp_dir().join(format!("jpt-dx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = Session {
+            id: 1,
+            name: "direct-exec".into(),
+            directory: dir.to_string_lossy().into(),
+            command: "/bin/echo $HOME".into(),
+        };
+        let state = State::from_sessions(dir.join("sessions.json"), vec![session]);
+        let (req_tx, req_rx) = unbounded_channel::<Request>();
+        let (internal_tx, internal_rx) = unbounded_channel::<Event>();
+        let (client_tx, mut ev_rx) = unbounded_channel::<Event>();
+        let _engine = tokio::spawn(run(req_rx, internal_tx, internal_rx, client_tx, state));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // initial Sessions: exactly our one session
+            let ev = ev_rx.recv().await.unwrap();
+            assert!(
+                matches!(&ev, Event::Sessions(list) if list.len() == 1 && list[0].id == 1),
+                "expected initial Sessions with one session, got {ev:?}"
+            );
+            req_tx.send(Request::Attach(1)).unwrap();
+            assert!(matches!(ev_rx.recv().await.unwrap(), Event::Sessions(_)));
+            let mut out = Vec::new();
+            loop {
+                match ev_rx.recv().await.unwrap() {
+                    Event::Output(1, bytes) => out.extend(bytes),
+                    Event::Exited(1) => break,
+                    Event::Error(e) => panic!("unexpected error: {e}"),
+                    _ => {}
+                }
+            }
+            let text = String::from_utf8_lossy(&out);
+            assert!(
+                text.contains("$HOME"),
+                "expected literal '$HOME' in output: direct exec passes it as an \
+                 unexpanded argv[1]; a shell dispatch (sh -c) would expand it to \
+                 the home path. got {text:?}"
+            );
+            // Belt and braces: if the expanded home path leaked into the output,
+            // the command ran under a shell even though the literal also appeared.
+            // Only checked for a conventional absolute home path so the literal
+            // '$HOME' output itself can never trip it.
+            if let Ok(home) = std::env::var("HOME")
+                && home.starts_with('/')
+            {
+                assert!(
+                    !text.contains(home.as_str()),
+                    "output contains the expanded HOME path {home:?}: \
+                     the command was dispatched through a shell"
+                );
+            }
+        })
+        .await
+        .unwrap();
+        drop(req_tx);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

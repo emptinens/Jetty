@@ -10,11 +10,11 @@ Minimal, fast GUI AI agent orchestrator with a CLI: terminal sessions that run a
 - Async: Tokio, bridged into the UI with gpui_tokio.
 - RPC: typed request/response/stream. In-memory duplex when the engine is in-process; WebSocket (tokio-tungstenite + rustls) across processes.
 - Data: Loro (loro + loro-protocol) for session transcripts and the workspace registry; rusqlite for local snapshots; sync only when signed in.
-- Text: pulldown-cmark; our own syntax highlighter. Geist and Geist Mono.
-- In-app terminal: vendored gpui-terminal + portable-pty. No custom VTE parser.
+- Text: pulldown-cmark; our own syntax highlighter. Geist and Geist Mono. (Decision only, not yet in the build.)
+- In-app terminal: portable-pty today; plan is to vendor gpui-terminal. No custom VTE parser.
 - Session = name + directory + command. Any CLI, no presets. Defaults `$SHELL` and `$HOME`; a session bound to a project opens its CLI in that folder.
 - Today the registry is one JSON file (`$XDG_CONFIG_HOME/jetty/sessions.json`); rusqlite and Loro replace it when that layer lands.
-- Quit: dialog, leave running or kill. Reattach works only for sessions left running.
+- Quit: dialog, leave running or kill. Reattach will work only for sessions left running (not implemented yet).
 
 ## Workflow
 
@@ -36,12 +36,12 @@ Needs Rust 1.99+, wayland, xkbcommon, vulkan (all present on the dev box).
 ## Stack facts (probe-verified)
 
 - `gpui_platform` has no crates.io release: deps are zed git at revision `ba8159b4d324d137e08993d85fb023b484388ede`, plus `[patch.crates-io] gpui = { git = "https://github.com/zed-industries/zed", rev = "ba8159b4d324d137e08993d85fb023b484388ede" }` once gpui-terminal is vendored.
-- `vendor/gpui-terminal` is upstream 0.1.0 with 2 fixes (see its PATCHES.md). Delete its stale `src/main.rs` and `[[bin]]`: upstream's example does not compile on current gpui and breaks workspace builds.
+- Planned, not done: vendor `gpui-terminal` (upstream 0.1.0 with 2 fixes, see its PATCHES.md) under `vendor/gpui-terminal`. When vendoring, delete its stale `src/main.rs` and `[[bin]]`: upstream's example does not compile on current gpui and breaks workspace builds.
 - gpui API: `use gpui::AppContext` for `cx.new`; clone a `FocusHandle` before `focus(window, cx)`; a clickable div needs `.id(...)` (`InteractiveElement` in scope) and `.on_click` (`StatefulInteractiveElement` in scope).
 - gpui_tokio: `init(cx)` installs the tokio runtime, `Tokio::spawn(cx, fut)` and `Tokio::handle(cx)` bridge work both ways.
-- Quit interception: `Window::on_window_should_close`, `App::on_app_quit`.
-- Terminal: `TerminalView::new(writer, reader, config, cx)` + `with_resize_callback` (resize the PTY there) + `with_exit_callback`.
-- Vendored code keeps its upstream MIT/Apache license files.
+- Quit interception: `Window::on_window_should_close` (wired); `App::on_app_quit` (reserved for a future in-app quit action, not wired).
+- Terminal (planned, not done): `TerminalView::new(writer, reader, config, cx)` + `with_resize_callback` (resize the PTY there) + `with_exit_callback`.
+- Vendored code will keep its upstream MIT/Apache license files.
 
 ## Out of scope (for now)
 

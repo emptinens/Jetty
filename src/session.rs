@@ -68,12 +68,12 @@ pub fn load(path: &Path) -> Vec<Session> {
 }
 
 pub fn save(path: &Path, sessions: &[Session]) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            let msg = format!("cannot create {}: {e}", dir.display());
-            eprintln!("jetty: {msg}");
-            return Err(msg);
-        }
+    if let Some(dir) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        let msg = format!("cannot create {}: {e}", dir.display());
+        eprintln!("jetty: {msg}");
+        return Err(msg);
     }
     let file = SessionsFile {
         sessions: sessions.to_vec(),
@@ -93,11 +93,7 @@ pub fn save(path: &Path, sessions: &[Session]) -> Result<(), String> {
                 return Err(msg);
             }
             if let Err(e) = std::fs::rename(&tmp, path) {
-                let msg = format!(
-                    "cannot rename {} to {}: {e}",
-                    tmp.display(),
-                    path.display()
-                );
+                let msg = format!("cannot rename {} to {}: {e}", tmp.display(), path.display());
                 eprintln!("jetty: {msg}");
                 let _ = std::fs::remove_file(&tmp);
                 return Err(msg);
@@ -128,11 +124,7 @@ mod tests {
     use super::*;
 
     fn tmp_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "jetty-test-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir = std::env::temp_dir().join(format!("jetty-test-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("sessions.json")
@@ -314,7 +306,10 @@ mod tests {
 
         let sessions = load(&path);
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, 1, "single session with id:0 renumbered to 1");
+        assert_eq!(
+            sessions[0].id, 1,
+            "single session with id:0 renumbered to 1"
+        );
         assert_eq!(sessions[0].name, "single-zero");
         assert_eq!(sessions[0].directory, "/home/zero");
         assert_eq!(sessions[0].command, "/bin/zsh");
@@ -335,16 +330,17 @@ mod tests {
     #[test]
     fn seed_unwritable_path_returns_empty_without_panic() {
         // A regular file where the config dir should be makes create_dir_all fail.
-        let dir = std::env::temp_dir().join(format!(
-            "jetty-seed-unwritable-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("jetty-seed-unwritable-{}", std::process::id()));
         let _ = std::fs::remove_file(&dir);
         std::fs::write(&dir, "block").unwrap();
         let path = dir.join("sessions.json");
 
         let sessions = seed(&path);
-        assert!(sessions.is_empty(), "seed on unwritable path must return empty vec");
+        assert!(
+            sessions.is_empty(),
+            "seed on unwritable path must return empty vec"
+        );
 
         let _ = std::fs::remove_file(&dir);
     }
