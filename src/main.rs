@@ -1,20 +1,28 @@
+use std::collections::HashMap;
+
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window, WindowOptions, div, px, rgb, rgba, size,
+    AnyElement, App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowOptions, div, px, rgb,
+    rgba, size,
 };
 use gpui_platform::application;
+use gpui_terminal::{TerminalConfig, TerminalView};
 
 mod engine;
 mod protocol;
 mod session;
+mod terminal;
 
 use crate::protocol::{Event, Request};
+use crate::terminal::{EngineWriter, EventReader, Feed};
 
 struct Root {
     sessions: Vec<session::Session>,
     selected: Option<usize>,
     engine: engine::EngineHandle,
     quit_dialog: bool,
+    terminals: HashMap<u64, Entity<TerminalView>>,
+    feeds: HashMap<u64, Feed>,
 }
 
 impl Root {
@@ -24,6 +32,8 @@ impl Root {
             selected: None,
             engine,
             quit_dialog: false,
+            terminals: HashMap::new(),
+            feeds: HashMap::new(),
         };
         this.engine.send(Request::Snapshot);
         this
@@ -40,19 +50,63 @@ impl Root {
                 } else if self.selected.is_some_and(|s| s >= self.sessions.len()) {
                     self.selected = Some(self.sessions.len() - 1);
                 }
+                let live: Vec<u64> = self.sessions.iter().map(|s| s.id).collect();
+                self.terminals.retain(|id, _| live.contains(id));
+                self.feeds.retain(|id, _| live.contains(id));
+                if let Some(session) = self.selected.and_then(|i| self.sessions.get(i)).cloned() {
+                    self.ensure_terminal(&session, cx);
+                }
+                cx.notify();
+            }
+            Event::Output(id, bytes) => {
+                if let Some(feed) = self.feeds.get(&id) {
+                    let _ = feed.send(bytes);
+                }
+            }
+            Event::Exited(id) => {
+                // Dropping the feed ends the terminal reader (EOF).
+                self.feeds.remove(&id);
                 cx.notify();
             }
             Event::Error(msg) => {
                 eprintln!("jetty: engine error: {msg}");
             }
-            Event::Output(_, _) => {} // stub: terminal output in next node
-            Event::Exited(_) => {}    // stub: terminal exit in next node
         }
     }
 
-    fn select(&mut self, i: usize, cx: &mut Context<Self>) {
+    fn select(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(i);
+        if let Some(session) = self.sessions.get(i).cloned() {
+            self.ensure_terminal(&session, cx);
+            let focus = self
+                .terminals
+                .get(&session.id)
+                .map(|view| view.read(cx).focus_handle().clone());
+            if let Some(focus) = focus {
+                focus.focus(window, cx);
+            }
+        }
         cx.notify();
+    }
+
+    /// Creates the terminal view for a session (once) and attaches its pty.
+    fn ensure_terminal(&mut self, session: &session::Session, cx: &mut Context<Self>) {
+        let id = session.id;
+        if self.terminals.contains_key(&id) {
+            return;
+        }
+        let (feed, rx) = std::sync::mpsc::channel();
+        let writer = EngineWriter::new(self.engine.clone(), id);
+        let reader = EventReader::new(rx);
+        let engine = self.engine.clone();
+        let view = cx.new(|cx| {
+            TerminalView::new(writer, reader, TerminalConfig::default(), cx).with_resize_callback(
+                move |cols, rows| engine.send(Request::Resize(id, cols as u16, rows as u16)),
+            )
+        });
+        self.feeds.insert(id, feed);
+        self.terminals.insert(id, view);
+        self.engine.send(Request::Attach(id));
     }
 
     fn add(&mut self, cx: &mut Context<Self>) {
@@ -94,7 +148,9 @@ impl Render for Root {
                             .overflow_hidden()
                             .cursor_pointer()
                             .child(self.sessions[i].name.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| this.select(i, cx))),
+                            .on_click(
+                                cx.listener(move |this, _, window, cx| this.select(i, window, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -122,6 +178,24 @@ impl Render for Root {
                     .into_any_element(),
             ],
             None => vec![div().child("no session selected").into_any_element()],
+        };
+
+        let main_pane: AnyElement = match self
+            .selected
+            .and_then(|i| self.sessions.get(i))
+            .map(|s| s.id)
+            .and_then(|id| self.terminals.get(&id).cloned())
+        {
+            Some(view) => div().flex_1().h_full().child(view).into_any_element(),
+            None => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .h_full()
+                .gap_1()
+                .p_4()
+                .children(detail)
+                .into_any_element(),
         };
 
         let dialog: Vec<AnyElement> = if self.quit_dialog {
@@ -189,6 +263,7 @@ impl Render for Root {
         };
 
         div()
+            .flex()
             .relative()
             .size_full()
             .bg(rgb(0x111111))
@@ -217,16 +292,7 @@ impl Render for Root {
                             .on_click(cx.listener(|this, _, _, cx| this.add(cx))),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .h_full()
-                    .gap_1()
-                    .p_4()
-                    .children(detail),
-            )
+            .child(main_pane)
             .children(dialog)
     }
 }

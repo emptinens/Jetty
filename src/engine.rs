@@ -49,6 +49,7 @@ impl Drop for ChildGuard {
     }
 }
 
+#[derive(Clone)]
 pub struct EngineHandle(UnboundedSender<Request>);
 
 impl EngineHandle {

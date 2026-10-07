@@ -1,0 +1,46 @@
+# Vendored from crates.io `gpui-terminal` 0.1.0 (upstream: https://github.com/zortax/gpui-terminal).
+# Local changes are listed in PATCHES.md. The upstream [[bin]] (`src/main.rs`) is removed:
+# it does not compile against current gpui and would break workspace builds.
+[package]
+edition = "2024"
+name = "gpui-terminal"
+version = "0.1.0"
+authors = ["Leonard Seibold <git[@]zrtx.de>"]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Terminal emulator component for gpui"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zortax/gpui-terminal"
+
+[lib]
+name = "gpui_terminal"
+path = "src/lib.rs"
+
+[dependencies.alacritty_terminal]
+version = "0.25.1"
+
+[dependencies.anyhow]
+version = "1"
+
+[dependencies.arboard]
+version = "3"
+features = ["wayland-data-control"]
+
+[dependencies.flume]
+version = "0.12"
+
+[dependencies.gpui]
+version = "0.2.2"
+
+[dependencies.parking_lot]
+version = "0.12"
+
+[dependencies.portable-pty]
+version = "0.9"
+
+[dependencies.ropey]
+version = "1"
